@@ -255,7 +255,7 @@ tr.editing td{background:#eff6ff}
         <div class="mini">
           <button class="btn sm" id="geoBoth">Salin "Latitude, Longitude"</button>
         </div>
-        <small id="geoInfo" style="color:var(--mut);display:block;margin-top:6px">Klik "Pilih di peta", lalu klik lokasi rumah ibadah. Marker bisa digeser.</small>
+        <small id="geoInfo" style="color:var(--mut);display:block;margin-top:6px">Klik "Pilih di peta", lalu klik lokasi rumah ibadah. Marker bisa digeser.<br>Lokasi geotagging (Longitude, Latitude) yang disalin dapat digunakan untuk mengisi formulir di SITARI.</small>
       </div>
     </div>
   </div>
@@ -355,7 +355,7 @@ tr.editing td{background:#eff6ff}
       <p class="d">
         Kolom wajib: <code>nama</code>, <code>jenis</code>, <code>longitude</code>, <code>latitude</code>.
         Kolom opsional: <code>alamat</code>, <code>keterangan</code>.<br>
-        Jenis dikenali otomatis: Masjid, Mushola (termasuk Surau/Langgar), Gereja Protestan, Gereja Katolik, Pura, Vihara, Klenteng.
+        Jenis dikenali otomatis: Masjid, Mushola (termasuk Surau/Langgar), Gereja Protestan, Gereja Katolik, Pura, Vihara, Klenteng, Lainnya.
       </p>
       <div class="drop" id="dropCsv">
         Seret file ke sini atau <b>klik untuk memilih</b><br><small>.csv, .xlsx, .xls</small>
@@ -475,7 +475,8 @@ const JENIS = {
   'Gereja Katolik':   {color:'#7c3aed', icon:'⛪'},
   'Pura':             {color:'#ea580c', icon:'🛕'},
   'Vihara':           {color:'#ca8a04', icon:'☸️'},
-  'Klenteng':         {color:'#dc2626', icon:'🏮'}
+  'Klenteng':         {color:'#dc2626', icon:'🏮'},
+  'Lainnya':          {color:'#64748b', icon:'🛐'}
 };
 const LS_KEY = 'melawi_rumah_ibadah_v1';
 const MELAWI_BOUNDS = [[-1.15,111.30],[-0.05,112.45]];
@@ -513,6 +514,7 @@ function normJenis(v){
   if(s.includes('pura')) return 'Pura';
   if(/vihara|wihara/.test(s)) return 'Vihara';
   if(/klenteng|kelenteng|tridharma|kong hu cu|konghucu/.test(s)) return 'Klenteng';
+  if(/lain|lainnya|other|umum/.test(s)) return 'Lainnya';
   return null;
 }
 
@@ -1375,7 +1377,7 @@ function setGeo(lat, lng, pan){
   }else geoMarker.setLatLng([lat,lng]);
   if(pan) map.setView([lat,lng], Math.max(map.getZoom(), 17));
   const inside = lat>=MELAWI_BOUNDS[0][0]&&lat<=MELAWI_BOUNDS[1][0]&&lng>=MELAWI_BOUNDS[0][1]&&lng<=MELAWI_BOUNDS[1][1];
-  $('#geoInfo').innerHTML = inside ? 'Koordinat siap disalin.' : '⚠ Titik di luar perkiraan wilayah Kab. Melawi.';
+  $('#geoInfo').innerHTML = (inside ? 'Koordinat siap disalin.' : '⚠ Titik di luar perkiraan wilayah Kab. Melawi.') + '<br>Lokasi geotagging (Longitude, Latitude) yang disalin dapat digunakan untuk mengisi formulir di SITARI.';
 }
 
 function setGeoMode(on){
@@ -1413,7 +1415,7 @@ $('#geoGps').onclick = ()=>{
 $('#geoClear').onclick = ()=>{
   if(geoMarker){ map.removeLayer(geoMarker); geoMarker = null; }
   $('#geoLat').value = ''; $('#geoLng').value = '';
-  $('#geoInfo').textContent = 'Klik "Pilih di peta", lalu klik lokasi rumah ibadah.';
+  $('#geoInfo').innerHTML = 'Klik "Pilih di peta", lalu klik lokasi rumah ibadah. Marker bisa digeser.<br>Lokasi geotagging (Longitude, Latitude) yang disalin dapat digunakan untuk mengisi formulir di SITARI.';
   setGeoMode(false);
 };
 

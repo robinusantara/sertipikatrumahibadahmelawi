@@ -32,6 +32,7 @@ function normJenis(v: unknown): string | null {
   if (s.includes('pura')) return 'Pura';
   if (/vihara|wihara/.test(s)) return 'Vihara';
   if (/klenteng|kelenteng|tridharma|kong hu cu|konghucu/.test(s)) return 'Klenteng';
+  if (/lain|lainnya|other|umum/.test(s)) return 'Lainnya';
   return null;
 }
 
