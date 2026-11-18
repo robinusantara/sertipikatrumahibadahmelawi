@@ -2,9 +2,16 @@
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>WebGIS Rumah Ibadah Kabupaten Melawi</title>
 <meta name="description" content="Aplikasi WebGIS pemetaan rumah ibadah, geotagging, unggah CSV/Excel dan Shapefile, serta laporan status sertipikat Kabupaten Melawi.">
+<meta name="theme-color" content="#1e3a62">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="GIS Melawi">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <meta property="og:title" content="WebGIS Rumah Ibadah Kabupaten Melawi">
 <meta property="og:description" content="Aplikasi WebGIS pemetaan rumah ibadah, geotagging, unggah CSV/Excel dan Shapefile, serta laporan status sertipikat Kabupaten Melawi.">
 <meta property="og:type" content="website">
@@ -127,6 +134,11 @@ tr.editing td{background:#eff6ff}
 .auth-form{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .auth-form input{width:170px;padding:6px 9px;font-size:13px}
 
+.install-btn{margin-left:auto;background:#10b981;color:#fff;border:0;padding:7px 12px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.install-btn:hover{background:#059669}
+#offlineBanner{position:fixed;bottom:16px;left:16px;z-index:9400;background:#d97706;color:#fff;padding:7px 12px;border-radius:8px;font-size:12px;font-weight:600;box-shadow:0 2px 10px rgba(0,0,0,.25);display:none;align-items:center;gap:8px}
+#offlineBanner.show{display:flex}
+
 @media(max-width:800px){
   #page-map.active{grid-template-columns:1fr;grid-template-rows:auto 60vh;height:auto}
   #side{border-right:0;border-bottom:1px solid var(--line)}
@@ -134,6 +146,7 @@ tr.editing td{background:#eff6ff}
   nav{min-height:40px;height:auto;flex-wrap:wrap}
   #geoPanel{width:215px;top:8px;left:52px}
   .crud-grid{grid-template-columns:1fr}
+  .install-btn{margin-left:0}
 }
 </style>
 </head>
@@ -150,8 +163,19 @@ tr.editing td{background:#eff6ff}
     <a class="navlink" href="https://kantahmelawi.com/si_rumah_ibadah/index.php?r=login"
        target="_blank" rel="noopener noreferrer">🔗 SITARI ↗</a>
   </nav>
+  <button type="button" id="btnInstallApp" class="install-btn" style="display:none">📲 Instal App</button>
 </header>
 <div id="toast"></div>
+<div id="offlineBanner" role="status"><span>●</span> Mode Offline — Data tersimpan lokal digunakan</div>
+<div id="installGuideModal" class="adm-backdrop" role="dialog" aria-modal="true" aria-labelledby="installGuideTitle">
+  <div class="adm-modal">
+    <h3 id="installGuideTitle">📲 Instal Aplikasi Android / HP</h3>
+    <p id="installGuideBody" style="color:var(--txt);line-height:1.5"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button type="button" class="btn" id="installGuideClose">Tutup</button>
+    </div>
+  </div>
+</div>
 <div id="admModal" class="adm-backdrop" role="dialog" aria-modal="true" aria-labelledby="admModalTitle">
   <div class="adm-modal">
     <h3 id="admModalTitle">🔐 Login Admin</h3>
@@ -1816,6 +1840,71 @@ $('#btnCrudRefresh').onclick = async ()=>{
 
   // API eksternal (hanya aktif jika Netlify Function /api/ext tersedia)
   loadExternal(false);
+})();
+
+/* ================== PWA & STATUS KONEKSI ================== */
+(function initPWA(){
+  const btn = $('#btnInstallApp');
+  const modal = $('#installGuideModal');
+  const body = $('#installGuideBody');
+  const offlineEl = $('#offlineBanner');
+  let deferredPrompt = null;
+
+  const isStandalone =
+    window.matchMedia('(display-mode: standalone)').matches ||
+    window.navigator.standalone === true ||
+    /WebGISMelawiAndroid/i.test(navigator.userAgent);
+
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+
+  function updateInstallBtn(){
+    if(!btn) return;
+    btn.style.display = isStandalone ? 'none' : 'inline-flex';
+  }
+  updateInstallBtn();
+
+  window.addEventListener('beforeinstallprompt', e => {
+    e.preventDefault();
+    deferredPrompt = e;
+    updateInstallBtn();
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredPrompt = null;
+    if(btn) btn.style.display = 'none';
+    toast('✔ Aplikasi berhasil diinstal ke layar utama', 3500);
+  });
+
+  if(btn){
+    btn.onclick = async () => {
+      if(deferredPrompt){
+        deferredPrompt.prompt();
+        const choice = await deferredPrompt.userChoice;
+        if(choice.outcome === 'accepted'){
+          deferredPrompt = null;
+          btn.style.display = 'none';
+        }
+        return;
+      }
+      if(isIOS){
+        body.innerHTML = '1. Ketuk tombol <b>Bagikan (Share)</b> pada toolbar Safari.<br>2. Pilih <b>Tambahkan ke Layar Utama (Add to Home Screen)</b>.';
+      }else{
+        body.innerHTML = '1. Buka menu browser Chrome (ikon <b>⋮</b> di pojok kanan atas).<br>2. Pilih <b>Tambahkan ke layar utama</b> atau <b>Instal aplikasi</b>.<br><br><small style="color:var(--mut)">Jika dibuka di preview iframe, buka URL aplikasi langsung di tab Chrome Android terlebih dahulu.</small>';
+      }
+      modal.classList.add('open');
+    };
+  }
+
+  $('#installGuideClose').onclick = () => modal.classList.remove('open');
+  modal.onclick = e => { if(e.target === modal) modal.classList.remove('open'); };
+
+  function syncOnline(){
+    if(!offlineEl) return;
+    offlineEl.classList.toggle('show', !navigator.onLine);
+  }
+  window.addEventListener('online', syncOnline);
+  window.addEventListener('offline', syncOnline);
+  syncOnline();
 })();
 </script>
 </body>
