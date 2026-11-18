@@ -2,5 +2,7 @@
   "name": "WebGIS Rumah Ibadah Kabupaten Melawi",
   "description": "Aplikasi WebGIS pemetaan rumah ibadah, geotagging, unggah CSV/Excel dan Shapefile, serta laporan status sertipikat Kabupaten Melawi.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -30,6 +30,13 @@ nav .navlink:hover{color:#fff}
 
 .adm{display:none}
 body.admin .adm{display:inline-block}
+body:not(.admin) #page-crud,body:not(.admin) #page-csv,body:not(.admin) #page-shp{display:none!important}
+.adm-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9500;display:none;align-items:center;justify-content:center;padding:16px}
+.adm-backdrop.open{display:flex}
+.adm-modal{width:100%;max-width:360px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
+.adm-modal h3{margin:0 0 6px;font-size:17px}
+.adm-modal p{margin:0 0 12px;font-size:13px;color:var(--mut)}
+.adm-modal input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font-size:14px;margin-bottom:10px}
 
 #toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#1f2933;color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:9999;display:none;max-width:90vw}
 
@@ -136,7 +143,7 @@ tr.editing td{background:#eff6ff}
   <h1>🕌 WebGIS Rumah Ibadah – Kab. Melawi</h1>
   <nav>
     <button class="active" data-page="map">🗺️ Peta</button>
-    <button data-page="crud">🗂️ Kelola Data</button>
+    <button class="adm" data-page="crud">🗂️ Kelola Data</button>
     <button class="adm" data-page="csv">📄 Upload CSV / Excel</button>
     <button class="adm" data-page="shp">🧩 Upload Shapefile</button>
     <button data-page="rpt">📊 Laporan Sertipikat</button>
@@ -145,6 +152,21 @@ tr.editing td{background:#eff6ff}
   </nav>
 </header>
 <div id="toast"></div>
+<div id="admModal" class="adm-backdrop" role="dialog" aria-modal="true" aria-labelledby="admModalTitle">
+  <div class="adm-modal">
+    <h3 id="admModalTitle">🔐 Login Admin</h3>
+    <p>Masuk dengan akun admin untuk membuka menu Kelola Data, Upload CSV/Excel, dan Upload Shapefile.</p>
+    <form id="admModalForm">
+      <input type="email" id="admModalEmail" placeholder="Email admin" required autocomplete="username">
+      <input type="password" id="admModalPass" placeholder="Password" required autocomplete="current-password">
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button type="button" class="btn sec" id="admModalCancel">Batal</button>
+        <button type="submit" class="btn" id="admModalSubmit">Masuk</button>
+      </div>
+    </form>
+    <div id="admModalMsg"></div>
+  </div>
+</div>
 
 <!-- ============ PETA ============ -->
 <section id="page-map" class="page active">
@@ -618,27 +640,56 @@ function setAdmin(on){
   document.body.classList.toggle('admin', on);
   if(!on){
     const cur = document.querySelector('.page.active');
-    if(cur && /page-(csv|shp)/.test(cur.id)) goMap();
+    if(cur && /page-(crud|csv|shp)/.test(cur.id)) goMap();
   }
   if(typeof updateCrudAuthUI === 'function') updateCrudAuthUI();
 }
+function openAdmModal(){
+  $('#admModalMsg').innerHTML = '';
+  $('#admModalPass').value = '';
+  $('#admModal').classList.add('open');
+  setTimeout(()=>$('#admModalEmail').focus(), 40);
+}
+function closeAdmModal(){
+  $('#admModal').classList.remove('open');
+}
+$('#admModalCancel').onclick = closeAdmModal;
+$('#admModal').onclick = e=>{ if(e.target === $('#admModal')) closeAdmModal(); };
+$('#admModalForm').onsubmit = async e=>{
+  e.preventDefault();
+  const msg = $('#admModalMsg');
+  msg.innerHTML = '';
+  const btn = $('#admModalSubmit');
+  btn.disabled = true;
+  try{
+    const {error} = await sb.auth.signInWithPassword({
+      email: $('#admModalEmail').value.trim(),
+      password: $('#admModalPass').value
+    });
+    if(error) throw error;
+    closeAdmModal();
+    setAdmin(true);
+    toast('✔ Login admin berhasil');
+  }catch(err){
+    msg.innerHTML = `<div class="msg err">Login gagal: ${esc(err.message||err)}</div>`;
+  }finally{
+    btn.disabled = false;
+  }
+};
 async function askAdmin(){
-  if(isAdmin()){ if(sb) await sb.auth.signOut(); setAdmin(false); return; }
-  if(!serverOK){ setAdmin(true); return; }          // mode lokal tanpa server
-  const email = prompt('Email admin:');  if(!email) return;
-  const pw    = prompt('Password:');     if(!pw) return;
-  const {error} = await sb.auth.signInWithPassword({email:email.trim(), password:pw});
-  if(error) return alert('Login gagal: '+error.message);
-  setAdmin(true);
+  if(isAdmin()){ if(sb) await sb.auth.signOut(); setAdmin(false); toast('Logout admin berhasil'); return; }
+  if(!serverOK){ setAdmin(true); toast('Mode admin lokal aktif'); return; }          // mode lokal tanpa server
+  openAdmModal();
 }
 document.addEventListener('keydown', e=>{
+  if(e.key === 'Escape' && $('#admModal').classList.contains('open')) closeAdmModal();
   if(e.ctrlKey && e.shiftKey && e.key.toLowerCase()==='a'){ e.preventDefault(); askAdmin(); }
 });
 
 /* ================== NAVIGASI ================== */
 document.querySelectorAll('nav button').forEach(b=>{
   b.onclick = ()=>{
-    if(b.classList.contains('adm') && !isAdmin()) return;
+    if(b.classList.contains('adm') && !isAdmin()){ askAdmin(); return; }
     document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
     document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');
@@ -648,7 +699,12 @@ document.querySelectorAll('nav button').forEach(b=>{
   };
 });
 function goMap(){ document.querySelector('nav button[data-page="map"]').click(); }
-function goPage(p){ const b = document.querySelector(`nav button[data-page="${p}"]`); if(b) b.click(); }
+function goPage(p){
+  const b = document.querySelector(`nav button[data-page="${p}"]`);
+  if(!b) return;
+  if(b.classList.contains('adm') && !isAdmin()){ askAdmin(); return; }
+  b.click();
+}
 
 /* ================== PETA ================== */
 const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19, attribution:'&copy; OpenStreetMap contributors'});
