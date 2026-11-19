@@ -491,6 +491,10 @@ if(!window.L){
 const SUPABASE_URL      = 'https://jflqadlasztjrhxpivot.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_T-9AiIoEvqKO_VQo0AcnBA_UGazSXfW';                    // <-- ISI: anon public key (BUKAN service_role)
 
+/* Dideklarasikan di sini (paling atas) karena dipakai oleh REQ_MAX, addOverlay, dll.
+   Jika dideklarasikan setelah dipakai, terjadi error "Cannot access 'IS_MOBILE' before initialization". */
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (window.matchMedia && matchMedia('(pointer:coarse)').matches);
+
 const JENIS = {
   'Masjid':           {color:'#16a34a', icon:'🕌'},
   'Mushola':          {color:'#0d9488', icon:'☪️'},
@@ -864,7 +868,7 @@ const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoo
 const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19, attribution:'Tiles &copy; Esri'});
 const topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxZoom:17, attribution:'&copy; OpenStreetMap, SRTM | &copy; OpenTopoMap'});
 
-const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (window.matchMedia && matchMedia('(pointer:coarse)').matches);
+/* IS_MOBILE sudah dideklarasikan di bagian KONFIGURASI (paling atas) */
 const map = L.map('map',{
   layers:[osm],
   preferCanvas:true,                                   // poligon/titik digambar di <canvas>, bukan ribuan elemen SVG
