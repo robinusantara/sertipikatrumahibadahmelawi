@@ -276,7 +276,7 @@ tr.editing td{background:#eff6ff}
         </div>
       </div>
       <div id="crudLoginBox" style="display:none;margin-bottom:14px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fafbfc">
-        <div style="font-size:13px;font-weight:600;margin-bottom:4px">Login Admin Supabase</div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:4px">Login Admin</div>
         <div style="font-size:12px;color:var(--mut)">Masuk dengan akun admin jika database mewajibkan autentikasi untuk menambah, mengubah, atau menghapus data.</div>
         <form id="crudLoginForm" class="auth-form">
           <input type="email" id="crudAuthEmail" placeholder="Email admin" required>
@@ -637,15 +637,22 @@ async function persistLayer(o){
   let r = await sb.from('layer_chunks').delete().eq('layer_id', o.id); if(r.error) throw r.error;
   r = await sb.from('layers').upsert({id:o.id, name:o.name, color:o.color, chunks:chunks.length, count:o.fc.features.length});
   if(r.error) throw r.error;
-  for(let n=0; n<chunks.length; n++){
-    toast(`Mengunggah "${o.name}" (${n+1}/${chunks.length})...`, 0);
-    r = await sb.from('layer_chunks').insert({layer_id:o.id, n, features:chunks[n]});
-    if(r.error) throw r.error;
-  }
-  toast(`✔ Layer "${o.name}" tersimpan di Supabase`);
+  // unggah beberapa chunk sekaligus (3 paralel) agar jauh lebih cepat daripada satu per satu
+  let done = 0, next = 0;
+  const worker = async ()=>{
+    while(next < chunks.length){
+      const n = next++;
+      const res = await sb.from('layer_chunks').insert({layer_id:o.id, n, features:chunks[n]});
+      if(res.error) throw res.error;
+      toast(`Mengunggah "${o.name}" (${++done}/${chunks.length})...`, 0);
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(3,chunks.length)}, worker));
+  toast(`✔ Layer "${o.name}" tersimpan di Database`);
 }
 async function removeLayerStore(id){
   if(!serverOK) return idbDel(id);
+  cacheDel(id);
   const {error} = await sb.from('layers').delete().eq('id', id);   // chunk ikut terhapus (cascade)
   if(error) throw error;
 }
@@ -654,10 +661,60 @@ async function saveLayerColor(o){
   const {error} = await sb.from('layers').update({color:o.color}).eq('id', o.id);
   if(error) throw error;
 }
+/* Cache layer di IndexedDB terpisah: kunjungan berikutnya tidak perlu mengunduh ulang puluhan MB. */
+const CACHE_DB='melawi_layer_cache', CACHE_STORE='fc';
+function cacheDb(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(CACHE_DB,1);
+    r.onupgradeneeded = ()=>r.result.createObjectStore(CACHE_STORE,{keyPath:'id'});
+    r.onsuccess = ()=>res(r.result); r.onerror = ()=>rej(r.error);
+  });
+}
+async function cacheGet(id, ver){
+  try{
+    const db = await cacheDb();
+    return await new Promise(res=>{
+      const q = db.transaction(CACHE_STORE,'readonly').objectStore(CACHE_STORE).get(id);
+      q.onsuccess = ()=>res(q.result && q.result.ver===ver ? q.result.fc : null);
+      q.onerror = ()=>res(null);
+    });
+  }catch(e){ return null; }
+}
+async function cachePut(id, ver, fc){
+  try{
+    const db = await cacheDb();
+    db.transaction(CACHE_STORE,'readwrite').objectStore(CACHE_STORE).put({id, ver, fc});
+  }catch(e){}
+}
+function cacheDel(id){
+  cacheDb().then(db=>db.transaction(CACHE_STORE,'readwrite').objectStore(CACHE_STORE).delete(id)).catch(()=>{});
+}
+const layerVer = l => [l.count, l.chunks, l.created_at].join('|');
+
+async function fetchServerLayerFc(l){
+  const ver = layerVer(l);
+  const cached = await cacheGet(l.id, ver);
+  if(cached) return cached;
+  let feats;
+  if(l.chunks > 0){
+    // semua chunk diunduh bersamaan, bukan antre satu per satu
+    const parts = await Promise.all(Array.from({length:l.chunks}, async (_,n)=>{
+      const {data, error} = await sb.from('layer_chunks').select('features').eq('layer_id', l.id).eq('n', n).single();
+      if(error) throw error;
+      return data.features;
+    }));
+    feats = parts.flat();
+  }else{
+    const {data:rows, error} = await sb.from('layer_chunks').select('n,features').eq('layer_id', l.id).order('n');
+    if(error) throw error;
+    feats = rows.flatMap(r=>r.features);
+  }
+  const fc = {type:'FeatureCollection', features:feats};
+  cachePut(l.id, ver, fc);
+  return fc;
+}
 async function loadServerLayer(l){
-  const {data:rows, error} = await sb.from('layer_chunks').select('n,features').eq('layer_id', l.id).order('n');
-  if(error) throw error;
-  addOverlay(l.name, {type:'FeatureCollection', features:rows.flatMap(r=>r.features)}, {id:l.id, color:l.color, restore:true});
+  addOverlay(l.name, await fetchServerLayerFc(l), {id:l.id, color:l.color, restore:true});
 }
 
 /* ================== MODE ADMIN ================== */
@@ -737,7 +794,12 @@ const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoo
 const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19, attribution:'Tiles &copy; Esri'});
 const topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxZoom:17, attribution:'&copy; OpenStreetMap, SRTM | &copy; OpenTopoMap'});
 
-const map = L.map('map',{layers:[osm]}).fitBounds(MELAWI_BOUNDS);
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (window.matchMedia && matchMedia('(pointer:coarse)').matches);
+const map = L.map('map',{
+  layers:[osm],
+  preferCanvas:true,                                   // poligon/titik digambar di <canvas>, bukan ribuan elemen SVG
+  renderer:L.canvas({padding:.3, tolerance:IS_MOBILE?10:4}) // toleransi ketuk lebih besar di layar sentuh
+}).fitBounds(MELAWI_BOUNDS);
 const layerCtl = L.control.layers({'OpenStreetMap':osm,'Citra Satelit':sat,'Topografi':topo},{},{collapsed:true}).addTo(map);
 L.control.scale({imperial:false}).addTo(map);
 
@@ -917,10 +979,10 @@ $('#btnImport').onclick = async ()=>{
   const batch = staged.slice();
   try{
     if(serverOK){
-      toast('Menyimpan ke Supabase...', 0);
+      toast('Menyimpan ke Database...', 0);
       if(mode==='replace') await dbReplacePoints(batch); else await dbInsertPoints(batch);
       await reloadPoints();
-      toast(`✔ ${batch.length} titik tersimpan di Supabase`);
+      toast(`✔ ${batch.length} titik tersimpan di Database`);
     }else{
       if(mode==='replace') data = data.filter(d=>d.src==='api');
       let id = data.reduce((m,d)=>Math.max(m,d.id||0),0);
@@ -966,23 +1028,60 @@ const overlays = [];
 const PALETTE = ['#e11d48','#2563eb','#059669','#d97706','#7c3aed','#0891b2','#be185d'];
 setupDrop('#dropShp','#fileShp', handleShp);
 
+/* Parsing shapefile dijalankan di Web Worker supaya halaman tidak membeku (penting di HP).
+   Jika Worker gagal/tidak didukung, otomatis kembali ke parsing biasa. */
+const SHP_URL = 'https://unpkg.com/shpjs@4.0.4/dist/shp.min.js';
+function parseShpWorker(buf){
+  return new Promise((resolve,reject)=>{
+    let w, url;
+    try{
+      const src = `importScripts(${JSON.stringify(SHP_URL)});
+        const rc=c=>typeof c[0]==='number'?[Math.round(c[0]*1e6)/1e6,Math.round(c[1]*1e6)/1e6]:c.map(rc);
+        self.onmessage=async e=>{
+          try{
+            let r = await shp(e.data); r = Array.isArray(r)?r:[r];
+            r.forEach(fc=>{
+              fc.features = (fc.features||[]).filter(f=>f&&f.geometry&&f.geometry.coordinates&&f.geometry.coordinates.length);
+              fc.features.forEach(f=>{f.geometry.coordinates=rc(f.geometry.coordinates);});
+            });
+            postMessage({ok:r});
+          }catch(err){ postMessage({err:String(err&&err.message||err)}); }
+        };`;
+      url = URL.createObjectURL(new Blob([src],{type:'text/javascript'}));
+      w = new Worker(url);
+    }catch(e){ return reject(e); }
+    const done = fn=>v=>{ w.terminate(); URL.revokeObjectURL(url); fn(v); };
+    w.onmessage = e=> e.data.err ? done(reject)(new Error(e.data.err)) : done(resolve)(e.data.ok);
+    w.onerror = e=> done(reject)(new Error('worker'));
+    w.postMessage(buf,[buf]);
+  });
+}
+
 async function handleShp(file){
   const msg = $('#shpMsg'); msg.innerHTML='';
+  const info = t=> msg.innerHTML = `<div class="msg warn">${t}</div>`;
   try{
     if(!/\.zip$/i.test(file.name)) throw new Error('File harus berformat .zip');
-    msg.innerHTML = '<div class="msg warn">Membaca shapefile...</div>';
-    const gj = await shp(await file.arrayBuffer());
-    const list = (Array.isArray(gj)?gj:[gj]).filter(fc=>fc && fc.features && fc.features.length);
+    info('Membaca shapefile...');
+    let list;
+    try{
+      list = await parseShpWorker(await file.arrayBuffer());
+    }catch(e){
+      // cadangan: parsing di thread utama
+      const gj = await shp(await file.arrayBuffer());
+      list = (Array.isArray(gj)?gj:[gj]).map(roundFc);
+    }
+    list = list.filter(fc=>fc && fc.features && fc.features.length);
     if(!list.length) throw new Error('Tidak ada fitur di dalam shapefile.');
     const base = file.name.replace(/\.zip$/i,'');
     for(const fc of list){
-      roundFc(fc);
       const nm = list.length>1 ? (fc.fileName||base) : base;
+      info(`Menampilkan ${fc.features.length.toLocaleString('id-ID')} fitur...`);
       const o = addOverlay(nm, fc);
-      msg.innerHTML = '<div class="msg warn">Menyimpan layer...</div>';
+      info('Menyimpan layer...');
       await persistLayer(o);
     }
-    msg.innerHTML = `<div class="msg ok">${list.length} layer berhasil ditambahkan dan disimpan${serverOK?' di Supabase':' di browser'}.</div>`;
+    msg.innerHTML = `<div class="msg ok">${list.length} layer berhasil ditambahkan dan disimpan${serverOK?' di Database':' di browser'}.</div>`;
   }catch(e){
     msg.innerHTML = `<div class="msg err">Gagal: ${esc(e.message||e)}<br>
       Pastikan ZIP berisi minimal .shp dan .dbf (sertakan .prj agar koordinat dikonversi ke WGS84).</div>`;
@@ -990,21 +1089,39 @@ async function handleShp(file){
 }
 
 function addOverlay(name, fc, opts={}){
-  const color = opts.color || PALETTE[overlays.length % PALETTE.length];
-  const id = opts.id || genId();
-  const layer = L.geoJSON(fc,{
-    style:()=>({color, weight:2, fillColor:color, fillOpacity:.2}),
-    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color,fillColor:color,fillOpacity:.7}),
-    onEachFeature:(f,l)=>{
-      const p = f.properties||{};
-      const rows = Object.keys(p).slice(0,25).map(k=>`<tr><td><b>${esc(k)}</b></td><td>${esc(p[k])}</td></tr>`).join('');
-      l.bindPopup(`<div class="pop"><h4>${esc(name)}</h4>${rows?`<table>${rows}</table>`:'<i>Tanpa atribut</i>'}</div>`);
-    }
+  const o = {id:String(opts.id || genId()), name, fc, count:fc.features.length,
+             color: opts.color || PALETTE[overlays.length % PALETTE.length]};
+  // popup dibuat hanya saat fitur diklik (tidak membuat HTML untuk ribuan persil di awal)
+  const popupHtml = p=>{
+    p = p||{};
+    const rows = Object.keys(p).slice(0,25).map(k=>`<tr><td><b>${esc(k)}</b></td><td>${esc(p[k])}</td></tr>`).join('');
+    return `<div class="pop"><h4>${esc(name)}</h4>${rows?`<table>${rows}</table>`:'<i>Tanpa atribut</i>'}</div>`;
+  };
+  o.layer = L.geoJSON(null,{
+    style:()=>({color:o.color, weight:IS_MOBILE?1.5:2, fillColor:o.color, fillOpacity:.2, smoothFactor:IS_MOBILE?2:1.5}),
+    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color:o.color,fillColor:o.color,fillOpacity:.7}),
+    onEachFeature:(f,l)=>l.bindPopup(()=>popupHtml(f.properties),{maxHeight:260})
   }).addTo(map);
-  const o = {id:String(id), name, layer, fc, count:fc.features.length, color};
   overlays.push(o);
-  layerCtl.addOverlay(layer, '🧩 '+name);
-  if(!opts.restore){ try{ map.fitBounds(layer.getBounds().pad(0.05)); }catch(e){} }
+  layerCtl.addOverlay(o.layer, '🧩 '+name);
+
+  // zoom awal dihitung dari data (tanpa menunggu semua poligon digambar)
+  if(!opts.restore){
+    try{ const b = bboxOf(fc.features.map(f=>f.geometry&&f.geometry.coordinates).filter(Boolean));
+         if(isFinite(b[0])) map.fitBounds([[b[1],b[0]],[b[3],b[2]]],{padding:[20,20]}); }catch(e){}
+  }
+  // poligon ditambahkan bertahap agar peta tetap responsif selama pemuatan
+  const BATCH = IS_MOBILE ? 250 : 600;
+  o.ready = new Promise(res=>{
+    let i = 0;
+    const step = ()=>{
+      const end = Math.min(i+BATCH, fc.features.length);
+      o.layer.addData(fc.features.slice(i,end)); i = end;
+      if(i < fc.features.length) (window.requestIdleCallback ? requestIdleCallback(step,{timeout:60}) : setTimeout(step,0));
+      else res();
+    };
+    step();
+  });
   renderOverlays();
   return o;
 }
@@ -1027,7 +1144,7 @@ function renderOverlays(){
     el.querySelector('.tg').onchange = e=> e.target.checked ? map.addLayer(o.layer) : map.removeLayer(o.layer);
     el.querySelector('.cl').oninput  = e=>{ o.color=e.target.value; o.layer.setStyle({color:o.color, fillColor:o.color}); };
     el.querySelector('.cl').onchange = ()=> saveLayerColor(o).catch(e=>alert('Gagal menyimpan warna: '+e.message));
-    el.querySelector('.zm').onclick = ()=>{ goMap(); setTimeout(()=>{ try{map.fitBounds(o.layer.getBounds().pad(0.05));}catch(e){} },120); };
+    el.querySelector('.zm').onclick = ()=>{ goMap(); o.ready.then(()=>setTimeout(()=>{ try{map.fitBounds(o.layer.getBounds().pad(0.05));}catch(e){} },120)); };
     el.querySelector('.gj').onclick = ()=>{
       const a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([JSON.stringify(o.fc)],{type:'application/geo+json'}));
@@ -1640,11 +1757,11 @@ $('#crudForm').onsubmit = async e=>{
   try{
     const wasEdit = crudEditingId !== null;
     if(serverOK){
-      toast('Menyimpan ke database Supabase...', 0);
+      toast('Menyimpan ke database...', 0);
       if(wasEdit) await dbUpdatePoint(crudEditingId, payload);
       else await dbCreatePoint(payload);
       await reloadPoints();
-      toast(wasEdit ? '✔ Data berhasil diperbarui di Supabase' : '✔ Data baru ditambahkan ke Supabase');
+      toast(wasEdit ? '✔ Data berhasil diperbarui' : '✔ Data baru ditambahkan');
     }else{
       if(wasEdit){
         const idx = data.findIndex(d=>String(d.id)===String(crudEditingId));
@@ -1666,7 +1783,7 @@ $('#crudForm').onsubmit = async e=>{
     const errText = err.message || String(err);
     const needAuth = serverOK && !isAdmin() && /row-level security|permission|policy|unauthorized|jwt/i.test(errText);
     if(needAuth) $('#crudLoginBox').style.display = 'block';
-    msg.innerHTML = `<div class="msg err">Gagal menyimpan ke database: ${esc(errText)}${needAuth?' — Silakan login sebagai Admin Supabase di atas.':''}</div>`;
+    msg.innerHTML = `<div class="msg err">Gagal menyimpan ke database: ${esc(errText)}${needAuth?' — Silakan login sebagai Admin melalui tombol login di atas.':''}</div>`;
   }finally{
     btn.disabled = false;
   }
@@ -1677,10 +1794,10 @@ async function deleteCrudPoint(id){
   msg.innerHTML = '';
   try{
     if(serverOK){
-      toast('Menghapus dari database Supabase...', 0);
+      toast('Menghapus dari database...', 0);
       await dbDeletePoint(id);
       await reloadPoints();
-      toast('✔ Data dihapus dari Supabase');
+      toast('✔ Data dihapus');
     }else{
       data = data.filter(d=>String(d.id)!==String(id));
       saveLocal(); buildFilters(); render();
@@ -1695,7 +1812,7 @@ async function deleteCrudPoint(id){
     const errText = err.message || String(err);
     const needAuth = serverOK && !isAdmin() && /row-level security|permission|policy|unauthorized|jwt/i.test(errText);
     if(needAuth) $('#crudLoginBox').style.display = 'block';
-    msg.innerHTML = `<div class="msg err">Gagal menghapus data: ${esc(errText)}${needAuth?' — Silakan login sebagai Admin Supabase di atas.':''}</div>`;
+    msg.innerHTML = `<div class="msg err">Gagal menghapus data: ${esc(errText)}${needAuth?' — Silakan login sebagai Admin.':''}</div>`;
   }
 }
 
@@ -1822,12 +1939,16 @@ $('#btnCrudRefresh').onclick = async ()=>{
 
   if(serverOK){
     const list = srv.layers || [];
+    // semua layer diunduh serentak, lalu ditambahkan ke peta sesuai urutan
+    const jobs = list.map(l=>fetchServerLayerFc(l).catch(e=>{ console.warn('Gagal memuat layer', l.name, e); return null; }));
+    let ok = 0;
     for(let i=0;i<list.length;i++){
       toast(`Memuat layer ${i+1}/${list.length}: ${list[i].name}...`, 0);
-      try{ await loadServerLayer(list[i]); }
-      catch(e){ console.warn('Gagal memuat layer', list[i].name, e); }
+      const fc = await jobs[i];
+      if(!fc) continue;
+      addOverlay(list[i].name, fc, {id:list[i].id, color:list[i].color, restore:true}); ok++;
     }
-    if(list.length) toast('Layer selesai dimuat'); else toast('', 1);
+    if(list.length) toast(`Layer selesai dimuat (${ok}/${list.length})`); else toast('', 1);
   }else{
     try{ (await idbAll()).forEach(x=>addOverlay(x.name, x.fc, {id:x.id, color:x.color, restore:true})); }
     catch(e){ console.warn(e); }
