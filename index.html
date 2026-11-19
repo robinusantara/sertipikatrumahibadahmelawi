@@ -462,6 +462,9 @@ tr.editing td{background:#eff6ff}
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>(window.L&&L.markerClusterGroup)||document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"><\/script>')</script>
 <script>(window.L&&L.markerClusterGroup)||document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"><\/script>')</script>
+<script src="https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js"></script>
+<script>(window.L&&L.vectorGrid)||document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js"><\/script>')</script>
+<script>(window.L&&L.vectorGrid)||document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.VectorGrid/1.3.0/Leaflet.VectorGrid.bundled.min.js"><\/script>')</script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script>window.Papa||document.write('<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"><\/script>')</script>
 <script>window.Papa||document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"><\/script>')</script>
@@ -1146,6 +1149,11 @@ async function handleShp(file){
     const base = file.name.replace(/\.zip$/i,'');
     for(const fc of list){
       const nm = list.length>1 ? (fc.fileName||base) : base;
+      if(serverOK && isPersilFc(fc)){
+        info(`Layer persil terdeteksi (${fc.features.length.toLocaleString('id-ID')} fitur): hanya NIB, Tipe Hak, Kelurahan, Kecamatan yang disimpan sebagai vector tiles...`);
+        await uploadVectorLayer(nm, fc, info);
+        continue;
+      }
       info(`Menampilkan ${fc.features.length.toLocaleString('id-ID')} fitur...`);
       const o = addOverlay(nm, fc);
       info('Menyimpan layer...');
@@ -1196,6 +1204,137 @@ function addOverlay(name, fc, opts={}){
   return o;
 }
 
+
+/* ================== LAYER PERSIL: VECTOR TILES ==================
+   Poligon persil disimpan di tabel PostGIS (public.persil) dan dikirim ke peta per-tile (MVT)
+   oleh fungsi database persil_tile(). Hanya 4 atribut yang tersimpan & ditampilkan. */
+const VEC_MINZOOM = IS_MOBILE ? 14 : 13;
+const VEC_LABEL = {nib:'NIB', tipe_hak:'Tipe Hak', kelurahan:'Kelurahan', kecamatan:'Kecamatan'};
+
+function vecBounds(o){ const b=o.bounds; return b ? L.latLngBounds([[b[1],b[0]],[b[3],b[2]]]) : null; }
+
+function addVectorOverlay(l, opts={}){
+  const o = {id:String(l.id), name:l.name, kind:'vector', count:l.count||0, bounds:l.bounds||null,
+             color:l.color || PALETTE[overlays.length % PALETTE.length], ready:Promise.resolve()};
+  const url = `${SUPABASE_URL}/rest/v1/rpc/persil_tile?z={z}&x={x}&y={y}&p_layer=${encodeURIComponent(o.id)}`;
+  o.layer = L.vectorGrid.protobuf(url,{
+    rendererFactory: L.canvas.tile,
+    interactive: true,
+    minZoom: VEC_MINZOOM, maxNativeZoom: 17, maxZoom: 22,
+    vectorTileLayerStyles: { persil: ()=>({weight:IS_MOBILE?1:1.5, color:o.color, opacity:1, fill:true, fillColor:o.color, fillOpacity:.2}) },
+    fetchOptions: { headers:{ apikey:SUPABASE_ANON_KEY, Accept:'application/octet-stream' } }
+  });
+  o.layer.on('click', e=>{
+    const p = (e.layer && e.layer.properties) || {};
+    const rows = Object.keys(VEC_LABEL).map(k=>`<tr><td><b>${VEC_LABEL[k]}</b></td><td>${esc(p[k]!=null && p[k]!=='' ? p[k] : '-')}</td></tr>`).join('');
+    L.popup().setLatLng(e.latlng).setContent(`<div class="pop"><h4>${esc(o.name)}</h4><table>${rows}</table></div>`).openOn(map);
+  });
+  o.hint = ()=>{ if(map.hasLayer(o.layer) && map.getZoom() < VEC_MINZOOM) toast(`Perbesar peta (zoom ${VEC_MINZOOM}+) untuk melihat persil "${o.name}"`, 2500); };
+  map.on('zoomend', o.hint);
+  o.layer.addTo(map);
+  overlays.push(o);
+  layerCtl.addOverlay(o.layer, '🧩 '+o.name);
+  if(!opts.restore){ const b = vecBounds(o); if(b) map.fitBounds(b.pad(0.05)); }
+  o.hint();
+  renderOverlays();
+  return o;
+}
+
+/* Ambil 4 atribut dari shapefile (nama kolom boleh bervariasi) */
+const PERSIL_RE = {
+  NIB:       /^(NO)?NIB$|^NIB/,
+  TIPEHAK:   /^(TIPEHAK|JENISHAK)/,
+  KELURAHAN: /^(KELURAHAN|KEL|NAMAKEL|NMKEL|DESA|NAMADESA|NMDESA|WADMKD|DESAKEL|KELDESA)$/,
+  KECAMATAN: /^(KECAMATAN|KEC|NAMAKEC|NMKEC|WADMKC)$/
+};
+function pickProp(p, re){
+  let best = null;
+  for(const k in p){
+    if(re.test(k.toUpperCase().replace(/[^A-Z0-9]/g,'')) && (best===null || k.length<best.length || (k.length===best.length && k<best))) best = k;
+  }
+  if(best===null) return undefined;
+  const v = p[best];
+  return (v==null || String(v).trim()==='') ? undefined : String(v).trim();
+}
+function isPersilFc(fc){
+  const sample = fc.features.slice(0,200);
+  const poly = sample.some(f=>f.geometry && /Polygon/.test(f.geometry.type));
+  const nib  = sample.some(f=>f.properties && Object.keys(f.properties).some(k=>/nib/i.test(k)));
+  return poly && nib;
+}
+
+async function uploadVectorLayer(name, fc, info){
+  const id = genId(), color = PALETTE[overlays.length % PALETTE.length];
+  const feats = fc.features.filter(f=>f && f.geometry && /Polygon/.test(f.geometry.type)).map(f=>{
+    const src = f.properties || {}, props = {};
+    for(const [k,re] of Object.entries(PERSIL_RE)){ const v = pickProp(src,re); if(v!==undefined) props[k] = v; }
+    return {geometry:f.geometry, properties:props};
+  });
+  if(!feats.length) throw new Error(`Tidak ada poligon di layer "${name}".`);
+
+  const batches = []; let cur = [], size = 0;
+  for(const f of feats){
+    const sz = JSON.stringify(f).length;
+    if(size+sz > 700000 && cur.length){ batches.push(cur); cur=[]; size=0; }
+    cur.push(f); size += sz;
+  }
+  if(cur.length) batches.push(cur);
+
+  uploadingLayer = true;
+  let rowCreated = false;
+  try{
+    const ins = await sb.from('layers').insert({id, name, color, chunks:0, count:0, kind:'vector'});
+    if(ins.error) throw ins.error;
+    rowCreated = true;
+    let done = 0, next = 0, failed = null;
+    const worker = async ()=>{
+      while(next < batches.length && !failed){
+        const n = next++;
+        try{
+          await withRetry(async ()=>{
+            const res = await sb.rpc('persil_import', {p_layer:id, p_features:batches[n]});
+            if(res.error) throw res.error;
+          });
+          info(`Mengunggah persil "${name}" (${++done}/${batches.length}) — jangan tutup halaman...`);
+        }catch(e){ failed = e; }
+      }
+    };
+    await Promise.all(Array.from({length:Math.min(REQ_MAX,batches.length)}, worker));
+    if(failed) throw failed;
+    const fin = await sb.rpc('persil_finalize', {p_layer:id});
+    if(fin.error) throw fin.error;
+    const r = fin.data;
+    if(r.count !== feats.length) toast(`⚠ ${feats.length} poligon dikirim, ${r.count} tersimpan (geometri kosong/duplikat dilewati)`, 6000);
+    addVectorOverlay({id, name, color, count:r.count, bounds:r.bounds});
+  }catch(e){
+    if(rowCreated){ try{ await sb.from('layers').delete().eq('id', id); }catch(_){} }   // cascade menghapus persil setengah jadi
+    throw new Error('Gagal menyimpan ke Supabase ('+(e.message||e)+'). Layer belum tersimpan.');
+  }finally{
+    uploadingLayer = false;
+  }
+}
+
+/* Laporan: cocokkan titik rumah ibadah dengan layer persil vector di database */
+async function persilCek(layers){
+  const ids = layers.map(o=>o.id), names = Object.fromEntries(layers.map(o=>[o.id,o.name]));
+  const out = new Map(), BATCH = 250, jobs = [];
+  for(let st=0; st<data.length; st+=BATCH){
+    const pts = data.slice(st, st+BATCH).map((d,k)=>({i:st+k, lng:d.lng, lat:d.lat}));
+    jobs.push(limited(()=>withRetry(async ()=>{
+      const {data:rows, error} = await sb.rpc('persil_cek', {p_layers:ids, p_pts:pts});
+      if(error) throw error;
+      rows.forEach(r=>{
+        const a = out.get(r.i) || [];
+        a.push({nib:r.nib||'', layer:names[r.layer_id]||r.layer_id,
+                p:{NIB:r.nib||'', TIPEHAK:r.tipe_hak||'', KELURAHAN:r.kelurahan||'', KECAMATAN:r.kecamatan||''}});
+        out.set(r.i, a);
+      });
+    })));
+  }
+  await Promise.all(jobs);
+  return out;
+}
+
 function renderOverlays(){
   renderRptLayers();
   const box = $('#ovList');
@@ -1210,9 +1349,9 @@ function renderOverlays(){
     <div class="ov" data-id="${o.id}">
       <input type="checkbox" class="tg" ${map.hasLayer(o.layer)?'checked':''} title="Tampilkan">
       <input type="color" class="cl" value="${o.color}" title="Warna">
-      <div class="nm">${esc(o.name)}<small>${o.count} fitur</small></div>
+      <div class="nm">${esc(o.name)}<small>${o.kind==='vector' ? (o.count||0).toLocaleString('id-ID')+' persil · vector tiles (zoom '+VEC_MINZOOM+'+)' : o.count+' fitur'}</small></div>
       <button class="btn sec sm zm">Zoom</button>
-      <button class="btn sec sm gj">GeoJSON</button>
+      ${o.kind==='vector' ? '' : '<button class="btn sec sm gj">GeoJSON</button>'}
       <button class="btn red sm rm adm">Hapus</button>
     </div>`).join('');
   box.querySelectorAll('.ov.fail').forEach(el=>{
@@ -1232,10 +1371,11 @@ function renderOverlays(){
   box.querySelectorAll('.ov:not(.fail)').forEach(el=>{
     const o = overlays.find(x=>x.id===el.dataset.id);
     el.querySelector('.tg').onchange = e=> e.target.checked ? map.addLayer(o.layer) : map.removeLayer(o.layer);
-    el.querySelector('.cl').oninput  = e=>{ o.color=e.target.value; o.layer.setStyle({color:o.color, fillColor:o.color}); };
+    el.querySelector('.cl').oninput  = e=>{ o.color=e.target.value; if(o.kind==='vector'){ clearTimeout(o._rd); o._rd=setTimeout(()=>o.layer.redraw(),200); } else o.layer.setStyle({color:o.color, fillColor:o.color}); };
     el.querySelector('.cl').onchange = ()=> saveLayerColor(o).catch(e=>alert('Gagal menyimpan warna: '+e.message));
-    el.querySelector('.zm').onclick = ()=>{ goMap(); o.ready.then(()=>setTimeout(()=>{ try{map.fitBounds(o.layer.getBounds().pad(0.05));}catch(e){} },120)); };
-    el.querySelector('.gj').onclick = ()=>{
+    el.querySelector('.zm').onclick = ()=>{ goMap(); if(o.kind==='vector'){ const b=vecBounds(o); if(b) setTimeout(()=>map.fitBounds(b.pad(0.05)),120); return; } o.ready.then(()=>setTimeout(()=>{ try{map.fitBounds(o.layer.getBounds().pad(0.05));}catch(e){} },120)); };
+    const gjb = el.querySelector('.gj');
+    if(gjb) gjb.onclick = ()=>{
       const a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([JSON.stringify(o.fc)],{type:'application/geo+json'}));
       a.download = o.name.replace(/[^\w-]+/g,'_')+'.geojson'; a.click(); URL.revokeObjectURL(a.href);
@@ -1243,6 +1383,7 @@ function renderOverlays(){
     el.querySelector('.rm').onclick = async ()=>{
       if(!confirm('Hapus layer "'+o.name+'"?')) return;
       try{ await removeLayerStore(o.id); }catch(e){ return alert('Gagal menghapus: '+e.message); }
+      if(o.hint) map.off('zoomend', o.hint);
       map.removeLayer(o.layer); layerCtl.removeLayer(o.layer);
       overlays.splice(overlays.indexOf(o),1);
       renderOverlays();
@@ -1300,10 +1441,10 @@ function selectedOverlays(){ return sertOverlays().filter(o=>!rptOff.has(o.id));
 function fillWilayah(){
   const lyr = (sel, re, skipId)=>{
     const el = $(sel), cur = el.value;
-    el.innerHTML = '<option value="">(tidak dipakai)</option>' + overlays.map(o=>`<option value="${o.id}">${esc(o.name)}</option>`).join('');
+    el.innerHTML = '<option value="">(tidak dipakai)</option>' + overlays.filter(o=>o.kind!=='vector').map(o=>`<option value="${o.id}">${esc(o.name)}</option>`).join('');
     if(cur && overlays.some(o=>o.id===cur)) el.value = cur;
     else if(!el.dataset.touched){
-      const g = overlays.find(o=>re.test(o.name) && o.id!==skipId);
+      const g = overlays.find(o=>o.kind!=='vector' && re.test(o.name) && o.id!==skipId);
       if(g) el.value = g.id;
     }
   };
@@ -1313,7 +1454,7 @@ function fillWilayah(){
   const fld = (sel, layerSel, re)=>{
     const o = overlays.find(x=>x.id===$(layerSel).value), el = $(sel), cur = el.value;
     const keys = new Set();
-    if(o) o.fc.features.slice(0,50).forEach(f=>Object.keys(f.properties||{}).forEach(k=>keys.add(k)));
+    if(o && o.fc) o.fc.features.slice(0,50).forEach(f=>Object.keys(f.properties||{}).forEach(k=>keys.add(k)));
     const arr = [...keys];
     el.innerHTML = '<option value="">(tidak dipakai)</option>' + arr.map(k=>`<option>${esc(k)}</option>`).join('');
     el.value = arr.includes(cur) ? cur : (arr.find(k=>re.test(k)) || '');
@@ -1346,7 +1487,7 @@ function renderRptLayers(){
 }
 function fillNibFields(){
   const keys = new Set();
-  selectedOverlays().forEach(o=>o.fc.features.slice(0,200).forEach(f=>Object.keys(f.properties||{}).forEach(k=>keys.add(k))));
+  selectedOverlays().forEach(o=>{ if(o.kind==='vector') ['NIB','TIPEHAK','KELURAHAN','KECAMATAN'].forEach(k=>keys.add(k)); else o.fc.features.slice(0,200).forEach(f=>Object.keys(f.properties||{}).forEach(k=>keys.add(k))); });
   const arr = [...keys];
   const fill = (sel, re, emptyLabel)=>{
     const el = $(sel), c = el.value;
@@ -1360,7 +1501,7 @@ function fillNibFields(){
 
 function mkIdx(o){
   const a = [];
-  if(!o) return a;
+  if(!o || !o.fc) return a;
   o.fc.features.forEach(f=>{
     const g = f.geometry;
     if(!g || !/Polygon|GeometryCollection/.test(g.type)) return;
@@ -1374,7 +1515,7 @@ function mkIdx(o){
 const findPoly = (arr,x,y)=>arr.find(p=>x>=p.bb[0]&&x<=p.bb[2]&&y>=p.bb[1]&&y<=p.bb[3]&&geomHas(p.g,x,y));
 const propVal  = (p,f)=> (f && p && p[f]!=null) ? String(p[f]).trim() : '';
 
-$('#btnRptBuild').onclick = ()=>{
+$('#btnRptBuild').onclick = async ()=>{
   const msg = $('#rptMsg'); msg.innerHTML=''; $('#rptSummary').innerHTML=''; $('#rptTable').innerHTML='';
   $('#btnRptXlsx').disabled = true; rptResult = null;
 
@@ -1383,16 +1524,24 @@ $('#btnRptBuild').onclick = ()=>{
   if(!data.length){ msg.innerHTML='<div class="msg err">Belum ada data rumah ibadah.</div>'; return; }
 
   const field = $('#rptNib').value;
+  const selVec = sel.filter(o=>o.kind==='vector');
   const idx = [];
-  sel.forEach(o=>o.fc.features.forEach(f=>{
+  sel.filter(o=>o.kind!=='vector').forEach(o=>o.fc.features.forEach(f=>{
     const g = f.geometry;
     if(!g || !/Polygon|GeometryCollection/.test(g.type)) return;
     let bb; try{ bb = bboxOf(g.type==='GeometryCollection'? g.geometries.map(s=>s.coordinates) : g.coordinates); }catch(e){ return; }
     idx.push({bb, g, nib:getNib(f.properties,field), layer:o.name, p:f.properties||{}});
   }));
-  if(!idx.length){
+  if(!idx.length && !selVec.length){
     msg.innerHTML='<div class="msg err">Layer sertipikat terpilih tidak berisi poligon.</div>';
     return;
+  }
+  let vecHits = null;
+  if(selVec.length){
+    msg.innerHTML = '<div class="msg warn">Mencocokkan titik dengan layer persil di database...</div>';
+    try{ vecHits = await persilCek(selVec); }
+    catch(e){ msg.innerHTML = `<div class="msg err">Gagal mencocokkan dengan database: ${esc(e.message||e)}</div>`; return; }
+    msg.innerHTML = '';
   }
 
   const desaIdx = mkIdx(overlays.find(o=>o.id===$('#rptDesaLyr').value));
@@ -1401,7 +1550,7 @@ $('#btnRptBuild').onclick = ()=>{
   const fSD = $('#rptSertDesa').value, fSK = $('#rptSertKec').value;
 
   const rows = data.map((d,i)=>{
-    const hit = idx.filter(p=>d.lng>=p.bb[0]&&d.lng<=p.bb[2]&&d.lat>=p.bb[1]&&d.lat<=p.bb[3]&&geomHas(p.g,d.lng,d.lat));
+    const hit = idx.filter(p=>d.lng>=p.bb[0]&&d.lng<=p.bb[2]&&d.lat>=p.bb[1]&&d.lat<=p.bb[3]&&geomHas(p.g,d.lng,d.lat)).concat(vecHits ? (vecHits.get(i)||[]) : []);
     const nibs = [...new Set(hit.map(h=>h.nib).filter(Boolean))];
     const lyr  = [...new Set(hit.map(h=>h.layer))];
     const dh = findPoly(desaIdx,d.lng,d.lat), kh = findPoly(kecIdx,d.lng,d.lat);
@@ -1417,12 +1566,12 @@ $('#btnRptBuild').onclick = ()=>{
       Keterangan:d.keterangan||''
     };
   });
-  rptResult = {rows, layers:sel.map(o=>o.name), polygons:idx.length};
+  rptResult = {rows, layers:sel.map(o=>o.name), polygons:idx.length + selVec.reduce((a,o)=>a+(o.count||0),0)};
 
   const sudah = rows.filter(r=>r.Status==='Sudah Sertipikat').length;
   const noNib = rows.filter(r=>r.NIB==='(NIB kosong di shapefile)').length;
   const noDesa = rows.filter(r=>r.Desa==='-').length;
-  msg.innerHTML = `<div class="msg ok">Analisis selesai: ${rows.length} rumah ibadah dicocokkan dengan ${idx.length} poligon sertipikat.</div>` +
+  msg.innerHTML = `<div class="msg ok">Analisis selesai: ${rows.length} rumah ibadah dicocokkan dengan ${rptResult.polygons.toLocaleString('id-ID')} poligon sertipikat.</div>` +
     (noNib ? `<div class="msg warn">⚠ ${noNib} titik di dalam poligon tetapi NIB kosong. Periksa pilihan kolom NIB.</div>` : '') +
     (noDesa ? `<div class="msg warn">⚠ ${noDesa} titik belum memiliki data Desa. Unggah &amp; pilih shapefile batas desa agar semua titik terisi.</div>` : '');
 
@@ -2030,11 +2179,12 @@ $('#btnCrudRefresh').onclick = async ()=>{
   if(serverOK){
     const list = srv.layers || [];
     // semua layer diunduh serentak, lalu ditambahkan ke peta sesuai urutan
-    const jobs = list.map(l=>fetchServerLayerFc(l).then(fc=>({fc}), e=>({err:e.message||String(e)})));
+    const jobs = list.map(l=> l.kind==='vector' ? Promise.resolve({vec:true}) : fetchServerLayerFc(l).then(fc=>({fc}), e=>({err:e.message||String(e)})));
     let ok = 0;
     for(let i=0;i<list.length;i++){
       toast(`Memuat layer ${i+1}/${list.length}: ${list[i].name}...`, 0);
       const r = await jobs[i];
+      if(r.vec){ addVectorOverlay(list[i], {restore:true}); ok++; continue; }
       if(r.err){ console.warn('Gagal memuat layer', list[i].name, r.err); failedLayers.push({l:list[i], err:r.err}); continue; }
       addOverlay(list[i].name, r.fc, {id:list[i].id, color:list[i].color, restore:true}); ok++;
     }
